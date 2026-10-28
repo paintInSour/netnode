@@ -1,0 +1,16 @@
+# Example host table. Load at startup with:  netnode --iface eth1 --config hosts.example.toml
+# or from the prompt with:                   load hosts.example.toml
+#
+# Only `name` and `ip` are required. A missing prefix means /24, a missing MAC
+# is generated, and delay/jitter default to 0. `save <file>` writes this format.
+
+[[hosts]]
+name = "alpha"
+ip = "192.168.1.50/24"
+
+[[hosts]]
+name = "beta"
+ip = "192.168.1.51/24"
+mac = "02:4e:4e:00:00:02"
+delay = "40ms"
+jitter = "5ms"
