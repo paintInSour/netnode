@@ -9,24 +9,30 @@ User-facing build and run instructions are in [README.md](README.md).
 netnode is a single Rust binary that opens a raw `AF_PACKET` socket on one
 interface in promiscuous mode and impersonates any number of **virtual hosts**,
 each with its own IPv4 address, MAC address, delay and jitter. Virtual hosts
-answer ARP and ICMP echo. Everything is controlled from an interactive prompt.
+answer ARP and ICMP echo. Everything is controlled from an interactive prompt,
+from stdin, or with `netnode ctl` over a local control socket (for containers).
 Each node runs its own independent instance ("decentralized": no controller).
 
 ## Architecture
 
 ```text
             frames in                       lookup (ArcSwap load)
-  eth1 ───────────────► RX thread ◄──────────────────── Host table ◄── edit + swap ── CLI thread
-  (link.rs)  ◄───────── (rx.rs)                                                       (cli.rs)
-      ▲    reply, no delay  │ reply + deadline (bounded channel)                          ▲
-      │                     ▼                                                             │
-      └──────────────── TX thread (tx.rs): min-heap by deadline,       sniff lines ───────┘
-          delayed reply  sleep then spin                               (bounded channel)
+  eth1 ───────────────► RX thread ◄──────────────────── Host table ◄── edit + swap ── commands
+  (link.rs)  ◄───────── (rx.rs)                                                 (cli.rs, one at a time)
+      ▲    reply, no delay  │ reply + deadline (bounded channel)                    ▲      ▲
+      │                     ▼                                                       │      │
+      └──────────────── TX thread (tx.rs): min-heap by deadline       prompt/stdin ─┘      └─ control socket
+          delayed reply  sleep then spin                                                 (control.rs, netnode ctl)
 ```
+
+The main thread opens the link (waiting for it to appear), starts everything,
+then waits for the stop flag. The flag is set by `quit` at the local prompt,
+Ctrl-D on a terminal, `shutdown` from anywhere, or SIGTERM/SIGINT.
 
 | File | Responsibility |
 | --- | --- |
-| `src/main.rs` | Flags, opening the link, spawning threads, shutdown |
+| `src/main.rs` | Flags and the `ctl` subcommand, waiting for the interface, signals, spawning threads, shutdown |
+| `src/control.rs` | Control socket server and the `netnode ctl` client (NUL-terminated responses) |
 | `src/link.rs` | Raw socket, promiscuous mode, interface queries, timer slack. **The only `unsafe` code.** |
 | `src/hosts.rs` | `MacAddr`, `Ipv4Cidr`, `VirtualHost`, immutable `HostTable` with all validation |
 | `src/rx.rs` | Receive loop and `handle_frame` (pure decision logic, unit-tested) |
@@ -35,8 +41,10 @@ Each node runs its own independent instance ("decentralized": no controller).
 | `src/sniff.rs` | Packet-log formatting and filtering |
 | `src/stats.rs` | Relaxed atomic counters |
 | `src/config.rs` | TOML save/load, duration parsing |
-| `src/cli.rs` | Command definitions (clap), command execution, prompt loop |
+| `src/cli.rs` | Command definitions (clap), `Context::run_line`, terminal prompt, stdin reader |
 | `scripts/testbed.sh` | Network-namespace lab for manual and integration testing |
+| `scripts/container-test.sh` | Deploys an image the way containerlab does (start first, link later) and pings it |
+| `examples/containerlab/` | Example topology and host table |
 
 ## Rules the design depends on
 
@@ -52,9 +60,13 @@ Keep these true in every change.
    Anything that cannot keep up is dropped and counted, never waited for.
 3. **No allocation per received frame.** The RX buffer is reused. Replies
    allocate one `Vec` each; a buffer pool is planned, see below.
-4. **The CLI thread is the only writer of the host table.** It builds a new
-   `HostTable` (`with_added`, `with_timing`, `with_removed`) and stores it.
-   `HostTable` methods never mutate in place.
+4. **Commands run one at a time.** Every command source (prompt, stdin, control
+   sessions) goes through `Context::run_line`, which holds `command_lock`, builds a
+   new `HostTable` (`with_added`, `with_timing`, `with_removed`) and stores it.
+   `HostTable` methods never mutate in place, and the packet path never takes the lock.
+   Commands return their output as text; they never print directly.
+8. **netnode must survive having no terminal.** End of stdin never stops it, and
+   the interface may appear after startup. Containers depend on both.
 5. **Validation lives in `hosts.rs`.** CLI, config loading and future APIs all
    go through `HostTable::with_*`, so the rules are enforced once.
 6. **Decision logic stays testable without a socket.** `handle_frame` and the
@@ -79,9 +91,18 @@ sudo ip netns exec nn-peer ping -c 20 10.77.0.50
 sudo scripts/testbed.sh down
 ```
 
-To drive the prompt from a script, pipe commands into stdin, for example
-`printf 'host add a --ip 10.77.0.50\nhost list\nquit\n' | sudo netnode --iface vn0`.
+To drive netnode from a script, either pipe commands into stdin, for example
+`printf 'host add a --ip 10.77.0.50\nhost list\nquit\n' | sudo netnode --iface vn0`,
+or start it headless and use `sudo netnode ctl --iface vn0 host list`.
 When stdin is not a terminal, packet-log lines go straight to stdout.
+
+Changes to startup, `control.rs` or the Dockerfile also need the container test,
+which reproduces containerlab's start-then-link order (root and Docker required):
+
+```bash
+docker build -t netnode:latest .
+sudo scripts/container-test.sh netnode:latest
+```
 
 ## What was done (MVP, 2026-10-28)
 
@@ -122,6 +143,44 @@ All seven milestones from the plan are implemented.
   `PROMISC` flag: a socket membership does not set that flag.
 - A second gratuitous ARP is sent 1 s after the first.
 
+## v0.2 (2026-10-28): containers and containerlab
+
+**Problem reported:** deployed as a containerlab node, netnode exited at once with
+`interface eth1 not found`, and containerlab aborted the whole lab
+(`namespace path not available for container "clab-lab1-h3"`).
+
+**Causes:**
+
+1. Containerlab starts a container first and adds `eth1` afterwards; netnode looked for it immediately.
+2. Containerlab runs nodes without a terminal; stdin ends at once, which the
+   prompt treated as Ctrl-D, so netnode would have quit anyway.
+3. Without a terminal there was no way to send commands, and SIGTERM was not handled.
+
+**Changes:**
+
+- `--wait` (default 60 s): poll for the interface instead of failing.
+- End of stdin on a non-terminal no longer stops netnode; it runs headless.
+- Control socket (`/tmp/netnode-<iface>.sock`, mode 0600) and `netnode ctl`:
+  one-shot commands with an exit status, or an interactive session.
+- New `shutdown` command; `quit` now ends only the current session when used in `ctl`.
+- SIGTERM and SIGINT stop netnode cleanly (`docker stop` takes about 0.2 s instead of 10 s).
+- Commands return text instead of printing, and run under `command_lock`.
+
+**Verification:**
+
+- Reproduced the original failure with the v0.1 image using containerlab's start-then-link
+  order (`scripts/container-test.sh`): netnode exited before the link existed.
+- v0.2 in the same setup: waited for `eth1`, came up headless. Hosts added with
+  `docker exec <c> /netnode ctl ...` answered the peer container (0.19 ms and 40.3 ms
+  minimum RTT), with distinct MACs in the peer's ARP table.
+- Interactive `docker exec -it <c> /netnode ctl` works; `sniff` output appears in `docker logs`.
+- `--config` from a bind-mounted file loads at startup; `ctl shutdown` and `docker stop` exit with code 0.
+- The local terminal prompt, piped stdin, socket clean-up and release of promiscuous mode still behave as in v0.1.
+- 34 unit tests pass; clippy and rustfmt are clean.
+- Not yet run: containerlab itself (it could not be downloaded in the build sandbox),
+  and the Dockerfile's Alpine build stage (Docker Hub was unreachable). The images
+  above were assembled from a locally built static binary on a `scratch` base.
+
 ## Known limitations
 
 - Only ARP and ICMP echo are answered. TCP and UDP to a virtual host are counted as
@@ -131,14 +190,18 @@ All seven milestones from the plan are implemented.
 - One syscall per frame. That is fine for control traffic on 1 GbE, not line rate at 10 GbE.
 - IPv4 only; 802.1Q-tagged frames are counted as `other ethertype` and ignored.
 - Only the interface's primary IPv4 address is checked for conflicts with virtual hosts.
-- The prompt must stay attached to a terminal; there is no daemon mode yet.
+- The packet log is printed by the netnode process only; `netnode ctl` sessions do not receive it.
+- After a container restart, containerlab does not re-create `eth1`; netnode waits, exits
+  and is restarted by Docker until the link returns.
 
 ## What is planned next
 
 In priority order. Each item lists what "done" means.
 
-1. **Run the Docker build stage in CI.** Build the image from the Dockerfile on x86_64
-   and arm64 (buildx). Done when both images build and pass the lab test.
+1. **Run the Docker build stage and containerlab in CI.** Build the image from the
+   Dockerfile on x86_64 and arm64 (buildx), deploy `examples/containerlab/lab1.clab.yml`
+   and run `scripts/container-test.sh`. Done when both images build and both pass.
+   Also: `netnode ctl sniff` to stream the packet log to a `ctl` session.
 2. **Full traffic control with XDP.** An XDP program written with `aya` that drops,
    passes or redirects any frame on the interface, with rules managed from the prompt
    (`rule add drop proto udp port 53`, `rule list`, `rule del`). Done when a rule
@@ -152,9 +215,9 @@ In priority order. Each item lists what "done" means.
    answered without loss in a benchmark and `tx late` stays at 0 on pinned cores.
 5. **More protocols.** IPv6 with Neighbor Discovery, VLAN-tagged hosts (`--vlan`), DHCP
    for host addresses, and an ARP probe before `host add` to detect conflicts up front.
-6. **Decentralized coordination.** A daemon mode with a local control socket
-   (`netnode ctl host list`), then discovery between netnode instances on a segment,
-   sharing host inventories so no two nodes claim the same IP.
+6. **Decentralized coordination.** Headless mode and the local control socket exist
+   (v0.2). Next: discovery between netnode instances on a segment, sharing host
+   inventories so no two nodes claim the same IP.
 7. **Operations.** Prometheus metrics endpoint, systemd unit, a `--json` output mode
    for commands, persistent prompt history.
 

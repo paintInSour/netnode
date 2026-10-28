@@ -1,0 +1,30 @@
+# A neighbour (h1) cabled to netnode (h3) on eth1.
+#
+#   docker build -t netnode:latest ../..        # once, from this folder
+#   sudo containerlab deploy -t lab1.clab.yml
+#   docker exec -it clab-lab1-h3 /netnode ctl   # live prompt inside netnode
+#   docker exec clab-lab1-h1 ping -c 3 10.77.0.51
+#   sudo containerlab destroy -t lab1.clab.yml
+name: lab1
+
+topology:
+  nodes:
+    h1:
+      kind: linux
+      image: alpine:3.20
+      exec:
+        - ip addr add 10.77.0.10/24 dev eth1
+
+    h3:
+      kind: linux
+      image: netnode:latest
+      cap-add:
+        - NET_RAW
+        - NET_ADMIN
+      binds:
+        - hosts.toml:/data/hosts.toml:ro
+      # netnode waits for eth1: containerlab adds it after the container starts.
+      cmd: --iface eth1 --config /data/hosts.toml
+
+  links:
+    - endpoints: ["h1:eth1", "h3:eth1"]

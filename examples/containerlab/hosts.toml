@@ -1,0 +1,9 @@
+# Virtual hosts netnode creates on eth1 at startup.
+[[hosts]]
+name = "alpha"
+ip = "10.77.0.50/24"
+
+[[hosts]]
+name = "beta"
+ip = "10.77.0.51/24"
+delay = "40ms"

@@ -3,11 +3,14 @@
 # netnode container image: a single static binary on an empty (`scratch`) base.
 # Final image size is about 3 MB.
 #
-# Build:  docker build -t netnode .
-# Run:    docker run --rm -it --network host --cap-add NET_RAW --cap-add NET_ADMIN netnode --iface eth1
+# Build:   docker build -t netnode .
+# Run:     docker run --rm -it --network host --cap-add NET_RAW --cap-add NET_ADMIN netnode --iface eth1
+# Control: docker exec -it <container> /netnode ctl      (the image has no shell)
 #
-# `--network host` is required: netnode must see the host's real eth1, not the
-# container's virtual interface.
+# Use `--network host` to drive the host's real eth1. In containerlab, leave it
+# out: containerlab plugs eth1 into the container after it starts, and netnode
+# waits for it (`--wait`, default 60s). Without a terminal netnode runs headless
+# and stops cleanly on `docker stop`.
 
 # ---- build stage: compile against musl so the binary has no runtime dependencies
 ARG RUST_IMAGE=rust:1-alpine

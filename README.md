@@ -7,9 +7,9 @@ its own MAC address and its own response delay, so neighbours see separate
 machines at different "distances".
 
 ```text
-netnode> host add alpha --ip 192.168.1.50/24
+netnode(eth1)> host add alpha --ip 192.168.1.50/24
 added alpha 192.168.1.50/24 6a:b9:67:7d:f2:b2 delay=0s
-netnode> host add beta --ip 192.168.1.51/24 --delay 40ms --jitter 5ms
+netnode(eth1)> host add beta --ip 192.168.1.51/24 --delay 40ms --jitter 5ms
 added beta 192.168.1.51/24 16:69:f6:4d:8c:56 delay=40ms±5ms
 ```
 
@@ -84,12 +84,46 @@ sudo setcap cap_net_raw,cap_net_admin=eip ./netnode
 | --- | --- | --- |
 | `--iface <name>` | `eth1` | Interface to take over |
 | `--config <file>` | none | TOML file of hosts to load at startup |
+| `--wait <duration>` | `60s` | How long to wait for the interface to appear; `0` fails at once |
+| `--control <path>` | `/tmp/netnode-<iface>.sock` | Control socket used by `netnode ctl` |
 | `--log-level <level>` | `info` | `error`, `warn`, `info`, `debug` or `trace` |
 
-The prompt is interactive. On a remote node, run it inside `tmux` or `screen`
-so it survives a dropped SSH session.
+### With or without a terminal
+
+- **Started from a terminal:** you get the `netnode(eth1)>` prompt. `quit` or Ctrl-D stops netnode.
+- **Started without a terminal** (a container without `-it`, a service, `nohup`):
+  netnode runs headless until it receives SIGTERM or SIGINT, or a `shutdown` command.
+  Commands piped into stdin are still run; end of input does not stop it.
+
+### Controlling a running netnode: `netnode ctl`
+
+Every netnode listens on a local control socket. `netnode ctl` connects to it,
+from another terminal or with `docker exec`:
+
+```bash
+sudo netnode ctl host list                                      # one command
+sudo netnode ctl host add beta --ip 192.168.1.51/24 --delay 40ms
+sudo netnode ctl                                                # interactive prompt
+```
+
+| `ctl` option | Default | Meaning |
+| --- | --- | --- |
+| `--iface <name>` | `eth1` | Which netnode to talk to (picks the default socket path) |
+| `--control <path>` | `/tmp/netnode-<iface>.sock` | Socket path, if netnode was started with `--control` |
+| `--wait <duration>` | `10s` | How long to wait for netnode to start listening |
+
+`ctl` options go before the command. A one-shot command exits with status 1
+if it failed, so it can be used in scripts. In a `ctl` session, `quit` leaves the
+session and `shutdown` stops netnode. The packet log (`sniff on`) is printed by
+the netnode process itself, so in a container read it with `docker logs -f`.
+The socket is accessible to its owner only, so run `ctl` as the same user as netnode.
+
+On a remote machine, either keep the prompt in `tmux`/`screen`, or start netnode
+headless (`nohup sudo netnode --iface eth1 </dev/null &`) and use `netnode ctl`.
 
 ### Run with Docker
+
+Interactive:
 
 ```bash
 docker run --rm -it --network host \
@@ -98,14 +132,71 @@ docker run --rm -it --network host \
   netnode --iface eth1 --config hosts.toml
 ```
 
-- `--network host` is required, so the container sees the host's real `eth1`.
-- `-it` gives you the interactive prompt.
-- `-v "$PWD:/data"` lets `load` and `save` use files in your current directory.
+In the background:
+
+```bash
+docker run -d --name netnode --network host --cap-add NET_RAW --cap-add NET_ADMIN netnode --iface eth1
+docker exec -it netnode /netnode ctl        # prompt
+docker logs -f netnode                      # output and packet log
+docker stop netnode                         # clean shutdown
+```
+
+- `--network host` gives the container the host's real `eth1`. Leave it out when
+  another tool (such as containerlab) plugs `eth1` into the container itself.
+- `-v "$PWD:/data"` lets `load`, `save` and `--config` use files in your current directory.
+- The image has no shell; run `/netnode ctl` with `docker exec` directly, as above.
+
+## Containerlab
+
+Containerlab starts each container first and adds its `eth1` a moment later,
+without a terminal. netnode waits for `eth1` (up to `--wait`, default 60 s) and
+runs headless, so a node needs no special setup. A complete example is in
+[examples/containerlab](examples/containerlab):
+
+```yaml
+name: lab1
+topology:
+  nodes:
+    h1:
+      kind: linux
+      image: alpine:3.20
+      exec:
+        - ip addr add 10.77.0.10/24 dev eth1
+    h3:
+      kind: linux
+      image: netnode:latest
+      cap-add: [NET_RAW, NET_ADMIN]
+      binds:
+        - hosts.toml:/data/hosts.toml:ro
+      cmd: --iface eth1 --config /data/hosts.toml
+  links:
+    - endpoints: ["h1:eth1", "h3:eth1"]
+```
+
+```bash
+docker build -t netnode:latest .                       # from the repository root
+cd examples/containerlab && sudo containerlab deploy -t lab1.clab.yml
+docker exec -it clab-lab1-h3 /netnode ctl              # live prompt inside netnode
+docker exec clab-lab1-h1 ping -c 3 10.77.0.51          # ~40 ms
+docker logs -f clab-lab1-h3                            # netnode output and packet log
+```
+
+Notes:
+
+- `cmd` replaces the image's default arguments, so always include `--iface`.
+- Without a config file, add hosts after deploy: `docker exec clab-lab1-h3 /netnode ctl host add ...`.
+  A topology `exec:` entry works too, because `ctl` waits up to 10 s for netnode to start listening.
+- After a container restart, containerlab does not re-create `eth1`. netnode then
+  waits 60 s, exits with an error, and Docker restarts it; it recovers once the link is back.
+
+`scripts/container-test.sh` reproduces this start-then-link sequence with plain
+Docker, for testing images without containerlab.
 
 ## Commands
 
-Type these at the `netnode>` prompt. Every change applies to the next packet,
-with no restart. `help` and `help <command>` print full usage.
+Type these at the `netnode(eth1)>` prompt or pass them to `netnode ctl`. Every
+change applies to the next packet, with no restart. `help` and
+`help <command>` print full usage.
 
 | Command | What it does |
 | --- | --- |
@@ -118,7 +209,8 @@ with no restart. `help` and `help <command>` print full usage.
 | `sniff off` | Stop the packet log |
 | `save <file>` / `load <file>` | Write or read the host table as TOML |
 | `iface` | Interface name, MAC, MTU and IPv4 address |
-| `quit` (or `exit`, or Ctrl-D) | Exit; promiscuous mode is released automatically |
+| `quit` (or `exit`, or Ctrl-D) | Leave the prompt. At netnode's own prompt this stops netnode; in a `ctl` session it only ends the session |
+| `shutdown` | Stop netnode from any prompt or `ctl`; promiscuous mode is released automatically |
 
 Durations accept `0`, `500us`, `20ms`, `1s`. The delay applies to everything a
 host sends, ARP replies included, so the very first ping to a delayed host
@@ -183,8 +275,10 @@ or namespace.
 
 | Symptom | Likely cause and fix |
 | --- | --- |
-| `cannot open eth1 (run as root...)` | Missing privileges: use `sudo` or the `setcap` command above |
-| `interface eth1 not found` | Wrong name: list interfaces with `ip link` and pass `--iface` |
+| `cannot open eth1 (run as root...)` | Missing privileges: use `sudo` or the `setcap` command above; in Docker add `--cap-add NET_RAW --cap-add NET_ADMIN` |
+| `eth1 ... did not appear within 1m` | Wrong name (list with `ip link`, pass `--iface`), or the link was never created; raise `--wait` if your lab is slow to cable |
+| `netnode ctl`: `cannot connect` | netnode is not running, or uses a different `--iface`/`--control`; run `ctl` as the same user (often root) |
+| `another netnode is already listening` | Two instances on one interface; stop one, or give each its own `--control` path |
 | Neighbours get no ARP reply | Switch port security limits MACs per port; raise the limit for this port |
 | Works on bare metal, not in a VM | The hypervisor drops unknown MACs. Allow promiscuous mode, MAC changes and forged transmits on that vNIC. Public-cloud VPCs do not support this at all |
 | Nothing on Wi-Fi | Wi-Fi drivers refuse frames from extra MACs; use a wired port |

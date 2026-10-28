@@ -1,6 +1,6 @@
 [package]
 name = "netnode"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Host several virtual IP/MAC endpoints with configurable delays on one Ethernet port"
@@ -17,6 +17,7 @@ rand = "0.10.3"
 rustyline = "19.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
 shlex = "2.0.1"
+signal-hook = "0.4.5"
 thiserror = "2.0.21"
 toml = "1.1.8"
 tracing = "0.1.44"
